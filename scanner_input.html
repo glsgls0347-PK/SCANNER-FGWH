@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>UCC SCANNER INPUT</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: black;
+      color: white;
+      font-family: sans-serif;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    #infoOverlay {
+      position: fixed;
+      top: 20px;
+      left: 20px;
+      font-size: 1.8em;
+      font-weight: bold;
+      background: rgba(0,0,0,0.6);
+      padding: 12px 20px;
+      border-radius: 12px;
+      z-index: 9999;
+      white-space: pre-line;
+      pointer-events: none;
+    }
+
+    #feedback {
+      position: absolute;
+      top: 30%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 3.8em;
+      font-weight: bold;
+      text-align: center;
+      z-index: 1000;
+      text-shadow: 2px 2px 8px black;
+      white-space: pre-line;
+    }
+
+    #homeButton {
+      position: absolute;
+      bottom: 5%;
+      right: 5%;
+      font-size: 1.5em;
+      padding: 16px 30px;
+      background-color: #444;
+      color: white;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      z-index: 1001;
+    }
+
+    #codeInput {
+      position: absolute;
+      bottom: 20%;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 2em;
+      padding: 10px;
+      width: 80%;
+      text-align: center;
+      z-index: 1001;
+    }
+  </style>
+</head>
+<body>
+  <div id="infoOverlay"></div>
+  <div id="feedback"></div>
+  <input id="codeInput" type="text" placeholder="Scan barcode..." autofocus />
+  <button id="homeButton" onclick="goHome()">HOME</button>
+
+  <script>
+    const GAS_URL = "https://script.google.com/macros/s/AKfycbzu2-TcyQ9r4CB-8LHyurEHt7Mrq2ExT2oF-RNH4E04QoX3P-BWIJs7XshMAHg4gJKMXg/exec";
+    const params = new URLSearchParams(window.location.search);
+    const po = params.get("po");
+    const type = params.get("type");
+
+    document.getElementById("infoOverlay").innerText = `Type: ${type}\nP/O: ${po}`;
+    const feedback = document.getElementById("feedback");
+    const input = document.getElementById("codeInput");
+
+    // ===== 파이프라인: 제한된 동시 처리 =====
+    const pendingQueue = [];
+    let inflight = 0;
+    const MAX_IN_FLIGHT = 3; // 2~4 권장
+
+    // ===== 추가: 자동 반복/포커스/초미세 디듀플(120ms) =====
+    let lastCode = "";
+    let lastTs = 0;
+    const MICRO_DEDUP_MS = 120;
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" || e.repeat) return; // 자동 반복 Enter 무시
+      const code = input.value.trim();
+      input.value = "";
+      input.focus({ preventScroll: true }); // 포커스 즉시 복원
+
+      // 20자리 유지
+      if (!/^\d{20}$/.test(code)) {
+        setFeedback("❌\n\nInvalid Code", "red");
+        return;
+      }
+
+      // 같은 코드가 CR/LF 등으로 120ms 내 연속 입력되는 경우 한 번만 처리
+      const now = Date.now();
+      if (code === lastCode && (now - lastTs) < MICRO_DEDUP_MS) {
+        return;
+      }
+      lastCode = code;
+      lastTs = now;
+
+      // 즉시 대기표시
+      setFeedback("Please wait...", "gray");
+
+      // 큐 적재 후 펌프
+      pendingQueue.push(code);
+      pump();
+    });
+
+    function pump() {
+      while (inflight < MAX_IN_FLIGHT && pendingQueue.length > 0) {
+        const code = pendingQueue.shift();
+        inflight++;
+        sendOne(code).finally(() => {
+          // inflight 감소는 sendOne의 finally에서만 수행
+          pump();
+        });
+      }
+    }
+
+    async function sendOne(code) {
+      try {
+        const url = `${GAS_URL}?code=${encodeURIComponent(code)}&type=${encodeURIComponent(type)}&po=${encodeURIComponent(po)}`;
+        const res = await fetch(url, { cache: "no-store" });
+        const { status, row, sscc, message } = await res.json();
+
+        const norm = (status || "").toString().trim().toUpperCase();
+        const msg  = (message || "").toString().trim();
+
+        if (norm === "✓" || norm === "OK") {
+          let text = `✅\n\nSSCC: ${sscc}\n\nRow: ${row}`;
+          if (msg) text += `\n\n${msg}`;
+          setFeedback(text, "lime");
+        } else if (norm === "DUP") {
+          let text = `🔁 DUPLICATE\n\nSSCC: ${sscc}\n\nRow: ${row}`;
+          if (msg) text += `\n\n${msg}`;
+          setFeedback(text, "orange");
+        } else if (msg === "Sheet not found") {
+          setFeedback("❌\n\nSheet not found", "red");
+        } else if (norm === "NOT_REGISTERED" || norm === "INVALID" || norm === "❌" || norm === "") {
+          let text = "❌\n\nNot Registered";
+          if (msg && msg !== "Sheet not found") text += `\n\n${msg}`;
+          setFeedback(text, "red");
+        } else {
+          // 최종 폴백도 Not Registered로 통일
+          let text = "❌\n\nNot Registered";
+          if (msg && msg !== "Sheet not found") text += `\n\n${msg}`;
+          setFeedback(text, "red");
+        }
+      } catch (err) {
+        setFeedback("❌\n\nConnection Error", "red");
+      } finally {
+        inflight = Math.max(0, inflight - 1);
+      }
+    }
+
+    function setFeedback(text, color) {
+      feedback.style.color = color;
+      feedback.innerText = text;
+    }
+    // ===================================================
+
+    function goHome() {
+      window.location.href = "index.html";
+    }
+  </script>
+</body>
+</html>
